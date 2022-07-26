@@ -134,6 +134,7 @@ def semantic_change_detection_wrapper(
     require_word_in_vocab=False,
     hidden_layers_number=None,
     verbose=False,
+    output_file=None
 ):
     logger.info(
         f"Will evaluate on {corpus_name}, using {max_sentences=} and {hidden_layers_number=}"
@@ -189,6 +190,9 @@ def semantic_change_detection_wrapper(
             if score is None:
                 continue
             word_to_score[word] = score
+            if output_file is not None:
+                with open(output_file, 'a') as fout:
+                    fout.write('{}\t{}\n'.format(word, score))
         model_to_result_str[model] = compute_metrics(
             model,
             word_to_score,
@@ -345,13 +349,21 @@ def get_shifts(corpus_name, tokenizer=None):
 
 
 if __name__ == "__main__":
+    """
+    Need to have a folder: data/semeval_eng
+    with in this folder:
+        - truth/graded.txt
+        - corpus_1.txt
+        - corpus_2.txt
+    """
     hf_utils.prepare_tf_classes()
     utils.set_result_logger_level()
 
-    data_path = "data/semeval_eng_lemma_new"
+    data_path = "data/semeval_eng"
 
     corpus_name = Path(data_path).name
-    test_corpus_path = data_path
+    test_corpus_path = Path(data_path)
+    output_path =  Path(data_path) / "predicted_shifts.tsv"
 
     score_method = SCORE_METHOD.COSINE_DIST
     require_word_in_vocab = True
@@ -362,9 +374,9 @@ if __name__ == "__main__":
     )
     batch_size = 64
     verbose = False
-    device = 0
+    device = -1
 
-    MODEL_PATH = "results/TempoBERT_semeval_eng_from_bert-tiny_prepend_token_linebyline_dynamic_30epochs_lr3e-4_split"  # Path to your model
+    MODEL_PATH = "temp_att_model_semeval_eng" #"results/TempoBERT_semeval_eng_from_bert-tiny_prepend_token_linebyline_dynamic_30epochs_lr3e-4_split"  # Path to your model
     tester = test_bert.Tester(MODEL_PATH, device=device)
 
     if not verbose:
@@ -380,4 +392,5 @@ if __name__ == "__main__":
         require_word_in_vocab=require_word_in_vocab,
         hidden_layers_number=hidden_layers_number,
         verbose=verbose,
+        output_file=output_path
     )
