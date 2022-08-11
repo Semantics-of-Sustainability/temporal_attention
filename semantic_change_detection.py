@@ -3,10 +3,12 @@ from enum import Flag, auto
 from functools import partial
 from pathlib import Path
 from statistics import mean
+from collections import defaultdict
 
 import pandas as pd
 import scipy
 import torch
+import numpy as np
 from loguru import logger
 from tqdm import tqdm
 
@@ -83,6 +85,7 @@ def get_embedding(
     batch_size=None,
     require_word_in_vocab=False,
     hidden_layers_number=None,
+    save_embeddings=False
 ):
     if (require_word_in_vocab and not word in model.tokenizer.vocab) or len(
         sentences
@@ -103,12 +106,25 @@ def get_embedding(
         batch_size=batch_size,
         hidden_layers_number=hidden_layers_number,
     )
+    if save_embeddings:
+        embs_a = embs.numpy()
+        if embs.ndim == 1:
+            embs_a = embs_a[np.newaxis, :]
+        embs_a
     if embs.ndim == 1:
         #  in case of a single sentence, embs is actually the single embedding, not a list
-        return embs
+        if save_embeddings:
+            embs_a = embs.numpy()
+            embs_a = embs_a[np.newaxis, :]
+            return embs, embs_a
+        else:
+            return embs
     else:
         centroid = torch.mean(embs, dim=0)
-        return centroid
+        if save_embeddings:
+            return centroid, embs.numpy()
+        else:
+            return centroid
 
 
 def get_detection_function(score_method, config):
@@ -134,7 +150,8 @@ def semantic_change_detection_wrapper(
     require_word_in_vocab=False,
     hidden_layers_number=None,
     verbose=False,
-    output_file=None
+    output_file=None,
+    embedding_path=None
 ):
     logger.info(
         f"Will evaluate on {corpus_name}, using {max_sentences=} and {hidden_layers_number=}"
@@ -143,6 +160,10 @@ def semantic_change_detection_wrapper(
     text_files = data_utils.iterdir(test_corpus_path, suffix=".txt")
     model_to_result_str = {}
     target_words = None
+    if embedding_path is not None:
+        embedding_dict = defaultdict(dict)
+    else:
+        embedding_dict = None
     for model in models:
         shifts_dict = get_shifts(corpus_name, model.tokenizer)
         target_words = list(shifts_dict.keys())
@@ -179,14 +200,27 @@ def semantic_change_detection_wrapper(
                 ]
                 if missing_times:
                     logger.debug(f"Found no sentences for '{word}' at {missing_times}")
-            score = detection_function(
-                time_sentences,
-                model,
-                word,
-                score_method=score_method,
-                batch_size=batch_size,
-                hidden_layers_number=hidden_layers_number,
-            )
+            if embedding_dict is None:
+                score = detection_function(
+                    time_sentences,
+                    model,
+                    word,
+                    score_method=score_method,
+                    batch_size=batch_size,
+                    hidden_layers_number=hidden_layers_number,
+                    save_embeddings=False)
+            else:
+                score, emb = detection_function(
+                    time_sentences,
+                    model,
+                    word,
+                    score_method=score_method,
+                    batch_size=batch_size,
+                    hidden_layers_number=hidden_layers_number,
+                    save_embeddings=True)
+                for time in emb:
+                    embedding_dict[time][word] = emb[time]
+            
             if score is None:
                 continue
             word_to_score[word] = score
@@ -198,6 +232,12 @@ def semantic_change_detection_wrapper(
             word_to_score,
             shifts_dict,
         )
+    if embedding_dict is not None:
+        for time in embedding_dict:
+            fpath = embedding_path /  "corpus{}.npz".format(time)
+            emb_dict = embedding_dict[time]
+            np.savez_compressed(fpath, **emb_dict)
+
     logger.info("Final results:")
     for model, result_str in model_to_result_str.items():
         logger.info(result_str)
@@ -258,6 +298,7 @@ def semantic_change_detection_temporal(
     score_method=SCORE_METHOD.COSINE_DIST,
     batch_size=None,
     hidden_layers_number=None,
+    save_embeddings=False
 ):
     """
     For each time period,
@@ -268,7 +309,7 @@ def semantic_change_detection_temporal(
     if score_method == SCORE_METHOD.TIME_DIFF:
         raise NotImplementedError()
     elif score_method == SCORE_METHOD.COSINE_DIST:
-        embs = [
+        result = [
             get_embedding(
                 model,
                 sentences,
@@ -276,17 +317,26 @@ def semantic_change_detection_temporal(
                 time=time,
                 hidden_layers_number=hidden_layers_number,
                 batch_size=batch_size,
+                save_embeddings=save_embeddings
             )
             for time, sentences in time_sentences.items()
         ]
-        embs = [emb for emb in embs if emb.nelement() > 0]
-        if not embs:
+        if save_embeddings:
+            centroid, embs = zip(*result)
+        else:
+            centroid = result
+        centroid = [emb for emb in centroid if emb.nelement() > 0]
+        if not centroid:
             return
-        embs = torch.stack(embs)
+        centroid = torch.stack(centroid)
         # calculate the cosine distance between the first and last vectors
-        score = torch.dist(embs[0], embs[-1])
+        score = torch.dist(centroid[0], centroid[-1])
         score = score.item()
-    return score
+    if save_embeddings:
+        embs_dict = {time: emb for time,emb in zip(time_sentences.keys(), embs)}
+        return score, embs_dict
+    else:
+        return score
 
 
 def compute_metrics(
@@ -364,13 +414,14 @@ if __name__ == "__main__":
     corpus_name = Path(data_path).name
     test_corpus_path = Path(data_path)
     output_path =  Path(data_path) / "predicted_shifts.tsv"
+    embedding_path = Path(data_path) 
 
     score_method = SCORE_METHOD.COSINE_DIST
     require_word_in_vocab = True
 
     max_sentences = 200  # Limit the number of sentences for very popular words
     hidden_layers_number = (
-        4  # Specify None to use the default number for the specified method
+        13  # Specify None to use the default number for the specified method
     )
     batch_size = 64
     verbose = False
@@ -392,5 +443,6 @@ if __name__ == "__main__":
         require_word_in_vocab=require_word_in_vocab,
         hidden_layers_number=hidden_layers_number,
         verbose=verbose,
-        output_file=output_path
+        output_file=output_path,
+        embedding_path=embedding_path
     )
